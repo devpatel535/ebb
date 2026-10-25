@@ -78,6 +78,7 @@ Plus: 512GB already split three ways; Qubes wants 150GB+ to be usable.
 
 ```
 docs/TESTING.md             # hardware verification ladder — the lab notebook
+docs/step0-iommu-check.sh   # Step 0 preflight; runs on UBUNTU, not dom0
 qubes/                      # Engine A — runs in dom0
   bootstrap.sh              # idempotent installer
   verify.sh                 # topology assertions; run after every update
@@ -104,10 +105,16 @@ kvm/                        # Engine B — runs on the hardened host
 All files written and syntax-checked (`bash -n`, `xmllint`, YAML parse).
 Nothing has been executed against hardware.
 
-**Next action: Step 0 of `docs/TESTING.md`** — the `dmesg` IOMMU check on the
-Ubuntu install. That single result decides whether Engine A is viable on this
-laptop or whether it becomes a homelab-server project and Engine B is the
-near-term path.
+**Next action: Step 0 of `docs/TESTING.md`** — run
+`docs/step0-iommu-check.sh` on the Ubuntu install, on the metal. That single
+result decides whether Engine A is viable on this laptop or whether it becomes
+a homelab-server project and Engine B is the near-term path.
+
+Note the asymmetry before reading too much into it: Step 0 can *rule out*
+Engine A (no DMAR table, or no interrupt remapping, means `sys-net` and
+`sys-usb` are not containment) but it cannot *confirm* it. Xen does its own
+DMAR parsing and has its own quirk list. The authoritative check is still
+`xl info | grep virt_caps` in dom0 at Step 2.
 
 `docs/TESTING.md` is the working checklist. Fill in results and commit it as
 you go; it is the record of what has actually been proven versus what is
