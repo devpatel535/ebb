@@ -137,7 +137,7 @@ fi
 # Ask the policy engine what it would actually do, rather than trusting that
 # our file wins the ordering contest against 90-default.policy.
 if command -v qubes-policy-lookup >/dev/null 2>&1; then
-    head "Policy engine evaluation (authoritative)"
+    section "Policy engine evaluation (authoritative)"
     for target in vault personal work; do
         qvm-check --quiet "$target" 2>/dev/null || continue
         result="$(qubes-policy-lookup qubes.Filecopy "@dispvm:${DVM}" "$target" 2>&1 || true)"
