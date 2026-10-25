@@ -1,0 +1,36 @@
+<!--
+  Whonix-External
+
+  NAMING CORRECTION vs the original spec, which described External as the
+  "isolated internal network routing strictly between the Gateway and
+  Workstation". That is Whonix-Internal's job. In Whonix's own topology:
+
+    Whonix-External  = the Gateway's CLEARNET-facing leg. NAT to the host.
+                       Only the Gateway attaches here. This is where Tor
+                       traffic leaves for the real internet.
+
+    Whonix-Internal  = Gateway <-> Workstation only. No host interface,
+                       no NAT, no DHCP, no route anywhere.
+
+  Getting these backwards is how you build a workstation with a clearnet NIC
+  and never notice, because Tor Browser still works.
+-->
+<network>
+  <name>Whonix-External</name>
+  <bridge name='virbr1' stp='on' delay='0'/>
+  <forward mode='nat'>
+    <nat>
+      <port start='1024' end='65535'/>
+    </nat>
+  </forward>
+  <ip address='10.0.2.2' netmask='255.255.255.0'>
+    <dhcp>
+      <!--
+        Single-address range. The Gateway always gets 10.0.2.15, matching
+        Whonix's shipped static expectation, and nothing else can obtain a
+        lease on this bridge even if it is attached by mistake.
+      -->
+      <range start='10.0.2.15' end='10.0.2.15'/>
+    </dhcp>
+  </ip>
+</network>

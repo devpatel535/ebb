@@ -1,0 +1,75 @@
+## /etc/qubes/policy.d/30-hybrid-anon.policy
+##
+## Qubes 4.2+ policy format. Numeric prefix controls evaluation order:
+## 30- is evaluated before the 90-default.policy shipped by Qubes, so these
+## rules win. Do not edit 90-default.policy itself; it is package-owned and
+## will be overwritten on update.
+##
+## Specifier used throughout: @dispvm:anon-dvm
+##   Matches any disposable spawned from the anon-dvm template, including the
+##   preloaded ones. Using a tag instead would be fragile — tag inheritance
+##   onto unnamed disposables is not something to bet an anonymity boundary on.
+##
+## DESIGN NOTE — the spec asked for a "multi-factor dom0 prompt" before
+## clipboard data could leave an anonymous disposable. No such mechanism
+## exists. Qubes RPC policy has exactly three actions: allow, deny, ask.
+## Building an MFA prompt would mean shipping new code into dom0, which is the
+## last place in the system you want more code. What follows is the honest
+## version of that intent: unconditional deny on the paths that matter, and a
+## deliberate ask (with no default target pre-filled) everywhere else.
+
+### ------------------------------------------------------------------
+### Clipboard
+### ------------------------------------------------------------------
+
+## Nothing from an anonymous disposable reaches the vault. No prompt, because
+## a prompt is a thing you can click through at 2am.
+qubes.ClipboardPaste    *   @dispvm:anon-dvm    vault           deny
+
+## Into any other persistent qube: ask, every time, no default_target. You
+## have to consciously select the destination in the dom0 dialog.
+qubes.ClipboardPaste    *   @dispvm:anon-dvm    @anyvm          ask
+
+## Pasting *into* an anonymous disposable is also worth gating — it is the
+## classic deanonymisation vector (pasting a real name, a real address, a
+## logged-in session token into a Tor session).
+qubes.ClipboardPaste    *   @anyvm              @dispvm:anon-dvm    ask
+
+### ------------------------------------------------------------------
+### File movement
+### ------------------------------------------------------------------
+
+## No file ever leaves an anonymous disposable automatically. If you genuinely
+## need a file out, you are doing something that deserves a conscious manual
+## act, not a keybinding.
+qubes.Filecopy          *   @dispvm:anon-dvm    @anyvm          deny
+
+## Files into a disposable are fine — that is the whole "open this untrusted
+## PDF somewhere it cannot hurt me" workflow.
+qubes.Filecopy          *   @anyvm              @dispvm:anon-dvm    allow
+
+### ------------------------------------------------------------------
+### Open-in-VM / URL handoff
+### ------------------------------------------------------------------
+
+## 4.3 already blocks files and URLs from Whonix-Workstation qubes being
+## opened in a *non-Whonix* disposable (qubes-issues#10051). These lines cover
+## the inverse direction and the named-qube case, which that fix does not.
+
+## An anonymous disposable may not hand a file or URL to a persistent qube.
+## That is the single easiest way to correlate a Tor session with a clearnet
+## identity: "open this in my normal browser".
+qubes.OpenInVM          *   @dispvm:anon-dvm    @anyvm          deny
+qubes.OpenURL           *   @dispvm:anon-dvm    @anyvm          deny
+
+## Sending a URL *into* a fresh anonymous disposable is the good direction.
+qubes.OpenURL           *   @anyvm              @dispvm:anon-dvm    allow
+
+### ------------------------------------------------------------------
+### Admin API
+### ------------------------------------------------------------------
+
+## Explicit: an anonymous disposable has no business talking to qubesd.
+## (Default is deny, but an anonymity boundary should state its own
+## assumptions rather than inherit them.)
+admin.*                 *   @dispvm:anon-dvm    @anyvm          deny

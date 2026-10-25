@@ -1,0 +1,356 @@
+---
+# hybrid-paradigm :: Engine B
+#
+# Hardened Linux host + KVM/libvirt + Whonix KVM images.
+#
+#   ansible-playbook -i localhost, -c local -K playbook.yml
+#
+# This is the fallback for hardware that cannot run Qubes. Be clear about what
+# you are getting: isolation here is enforced by the host kernel and KVM, not
+# by a type-1 hypervisor with the host OS itself compartmentalised. A host
+# kernel compromise owns everything. In Qubes, a dom0 compromise owns
+# everything too — but dom0 has no network card and runs no browser, and that
+# difference is the entire point. Engine B's host runs your desktop.
+
+- name: Build the hardened KVM anonymity host
+  hosts: all
+  become: true
+
+  vars:
+    # ----------------------------------------------------------------------
+    # YOU MUST SET THIS. Do not take a key fingerprint from a script someone
+    # (or something) handed you. Get it from https://www.whonix.org/wiki/
+    # Whonix_Signing_Key over a connection you trust, ideally cross-checked
+    # against a second source, and paste it here.
+    # ----------------------------------------------------------------------
+    whonix_signing_key_fpr: "CHANGE_ME"
+
+    whonix_version: ""          # e.g. "18.0.0.0.0" — set to the release you verified
+    whonix_mirror: "https://download.whonix.org/libvirt"
+
+    image_dir: /var/lib/libvirt/images/whonix
+    gold_dir: /var/lib/libvirt/images/whonix-gold
+
+    # Overlay location for amnesic sessions. tmpfs means session writes never
+    # touch a platter or an SSD cell at all — the strongest version of the
+    # Tails property. Size it to your RAM; 4G is comfortable for browsing.
+    amnesic_tmpfs_size: "4G"
+
+  tasks:
+
+    # ======================================================================
+    # Fact gathering and distro divergence
+    # ======================================================================
+
+    - name: Detect primary MAC framework
+      # The spec's lsm= string listed apparmor AND selinux. You cannot run
+      # both as primary; on any given distro one of them is simply
+      # unconfigured and enforcing nothing while you believe otherwise.
+      ansible.builtin.set_fact:
+        primary_mac: "{{ 'selinux' if ansible_facts['os_family'] == 'RedHat' else 'apparmor' }}"
+
+    - name: Detect TSX presence
+      # tsx=off is a no-op on CPUs without TSX (everything 12th-gen Intel and
+      # later, all AMD). Emitting it unconditionally is harmless but it clutters
+      # the cmdline and implies a mitigation that is not happening.
+      ansible.builtin.shell:
+        cmd: "grep -qw rtm /proc/cpuinfo && echo yes || echo no"
+      register: tsx_check
+      changed_when: false
+
+    - name: Verify CRNG was properly seeded at boot
+      # This REPLACES the spec's entropy_avail gate. Since Linux 5.18 the CRNG
+      # is seeded once at boot and never blocks afterward; entropy_avail sits
+      # near 256 permanently and tells you nothing actionable. The real
+      # question is whether the kernel announced a successful seed.
+      ansible.builtin.shell:
+        cmd: "dmesg 2>/dev/null | grep -c 'crng init done' || true"
+      register: crng_check
+      changed_when: false
+      failed_when: false
+
+    - name: Warn if CRNG seeding could not be confirmed
+      ansible.builtin.debug:
+        msg: >-
+          Could not confirm 'crng init done' in dmesg (kernel.dmesg_restrict
+          may already be set, which is fine). If this is a fresh VM or an
+          embedded board with no hardware RNG, confirm seeding manually before
+          generating any long-lived keys.
+      when: crng_check.stdout | int == 0
+
+    # ======================================================================
+    # Packages
+    # ======================================================================
+
+    - name: Install virtualisation and tooling (RedHat family)
+      ansible.builtin.dnf:
+        name:
+          - libvirt
+          - libvirt-daemon-kvm
+          - qemu-kvm
+          - virt-manager
+          - virt-install
+          - rng-tools
+          - gnupg2
+          - xz
+          - policycoreutils-python-utils
+        state: present
+      when: ansible_facts['os_family'] == 'RedHat'
+
+    - name: Install virtualisation and tooling (Debian family)
+      ansible.builtin.apt:
+        name:
+          - libvirt-daemon-system
+          - libvirt-clients
+          - qemu-system-x86
+          - qemu-utils
+          - virt-manager
+          - rng-tools5
+          - gnupg
+          - xz-utils
+          - apparmor-utils
+        state: present
+        update_cache: true
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Enable rngd if a hardware RNG is present
+      # The honest version of the spec's "interface with hardware RNG". rngd
+      # feeds a TPM/RDRAND/hwrng source into the kernel pool. It is useful on
+      # hardware that has one and pointless noise on hardware that does not,
+      # so we condition on the device actually existing.
+      ansible.builtin.systemd:
+        name: rngd
+        enabled: true
+        state: started
+      when: "'/dev/hwrng' is exists or ansible_facts['processor_features'] is defined and 'rdrand' in ansible_facts['processor_features']"
+      failed_when: false
+
+    # ======================================================================
+    # Kernel command line
+    # ======================================================================
+
+    - name: Compose hardened kernel parameters
+      ansible.builtin.set_fact:
+        hardened_cmdline: >-
+          lsm=landlock,lockdown,yama,bpf,{{ primary_mac }}
+          lockdown=confidentiality
+          init_on_alloc=1
+          init_on_free=1
+          page_alloc.shuffle=1
+          slab_nomerge
+          randomize_kstack_offset=on
+          vsyscall=none
+          spec_store_bypass_disable=on
+          debugfs=off
+          module.sig_enforce=1
+          {{ 'tsx=off tsx_async_abort=full,nosmt' if tsx_check.stdout == 'yes' else '' }}
+
+    # Reasoning for the deltas from the submitted list, recorded here so the
+    # next person to read this file does not "restore" them:
+    #
+    #   DROPPED page_poison=1  — superseded by init_on_free=1. Running both
+    #     means zeroing pages twice on free for no additional property.
+    #
+    #   DROPPED slub_debug=FZP — this is a DEBUG facility: red-zoning,
+    #     poisoning and full sanity checks on every slab object. Real-world
+    #     cost is routinely 10-30% on allocation-heavy workloads, which a KVM
+    #     host very much is. It also implicitly disables slab merging, making
+    #     slab_nomerge redundant alongside it. If you want the hardening
+    #     without the debug cost, init_on_alloc/init_on_free is that.
+    #
+    #   DROPPED quiet loglevel=0 — silencing the console on a machine whose
+    #     security depends on IOMMU state, CRNG seeding and module signature
+    #     enforcement is self-defeating. You want to see those messages.
+    #
+    #   DROPPED vga=current — a cosmetic framebuffer handoff flag with no
+    #     security content.
+    #
+    #   ADDED debugfs=off — removes a large, rarely-needed kernel interface.
+    #   ADDED module.sig_enforce=1 — refuses unsigned modules. This is the
+    #     closest thing on a PC to the verified-boot property the spec asked
+    #     for; note it will break out-of-tree DKMS modules (NVIDIA, VirtualBox)
+    #     unless you enroll your own MOK.
+    #   ADDED lockdown=confidentiality — blocks /dev/mem, kexec, and other
+    #     paths that read kernel memory, even from root.
+    #   ADDED bpf to the LSM list — enables the BPF LSM hooks.
+
+    - name: Apply kernel parameters (GRUB, Debian family)
+      ansible.builtin.lineinfile:
+        path: /etc/default/grub
+        regexp: '^GRUB_CMDLINE_LINUX_DEFAULT='
+        line: 'GRUB_CMDLINE_LINUX_DEFAULT="{{ hardened_cmdline | trim | regex_replace("\s+", " ") }}"'
+        backup: true
+      when: ansible_facts['os_family'] == 'Debian'
+      notify: regenerate grub debian
+
+    - name: Apply kernel parameters (grubby, RedHat family)
+      ansible.builtin.command:
+        cmd: "grubby --update-kernel=ALL --args='{{ hardened_cmdline | trim | regex_replace('\\s+', ' ') }}'"
+      when: ansible_facts['os_family'] == 'RedHat'
+      changed_when: true
+
+    # ======================================================================
+    # sysctl
+    # ======================================================================
+
+    - name: Install hardened sysctl set
+      ansible.builtin.copy:
+        src: files/99-hardened.conf
+        dest: /etc/sysctl.d/99-hardened.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: reload sysctl
+
+    # ======================================================================
+    # libvirt networks
+    # ======================================================================
+
+    - name: Ensure libvirtd is running
+      ansible.builtin.systemd:
+        name: libvirtd
+        enabled: true
+        state: started
+
+    - name: Remove libvirt's default NAT network
+      # The default network is a bridge the Workstation could be attached to
+      # by a careless virt-manager click, and it reaches the real internet.
+      # On an anonymity host it should not exist.
+      ansible.builtin.shell:
+        cmd: |
+          virsh net-destroy default 2>/dev/null || true
+          virsh net-undefine default 2>/dev/null || true
+      register: default_net
+      changed_when: "'destroyed' in default_net.stdout or 'undefined' in default_net.stdout"
+
+    - name: Stage network definitions
+      ansible.builtin.copy:
+        src: "files/{{ item }}"
+        dest: "/etc/libvirt/qemu/networks/staged-{{ item }}"
+        mode: '0600'
+      loop:
+        - whonix-external.xml
+        - whonix-internal.xml
+
+    - name: Define and autostart Whonix networks
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          virsh net-define /etc/libvirt/qemu/networks/staged-{{ item.file }}
+          virsh net-autostart {{ item.name }}
+          virsh net-start {{ item.name }} 2>/dev/null || true
+      loop:
+        - { file: 'whonix-external.xml', name: 'Whonix-External' }
+        - { file: 'whonix-internal.xml', name: 'Whonix-Internal' }
+      register: netdef
+      changed_when: "'defined' in netdef.stdout"
+
+    # ======================================================================
+    # Whonix images
+    # ======================================================================
+
+    - name: Refuse to proceed with an unset signing key
+      ansible.builtin.fail:
+        msg: >-
+          whonix_signing_key_fpr is unset. Fetch the Whonix signing key
+          fingerprint yourself from whonix.org and set it in this playbook's
+          vars. A fingerprint handed to you inside an automation script is a
+          fingerprint you have not verified, and verifying a signature against
+          an unverified key is theatre.
+      when: whonix_signing_key_fpr == "CHANGE_ME" or whonix_version == ""
+
+    - name: Create image directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      loop:
+        - "{{ image_dir }}"
+        - "{{ gold_dir }}"
+
+    - name: Import Whonix signing key
+      ansible.builtin.shell:
+        cmd: "gpg --keyserver hkps://keys.openpgp.org --recv-keys {{ whonix_signing_key_fpr }}"
+      register: keyimport
+      changed_when: "'imported' in keyimport.stderr"
+
+    - name: Download Whonix KVM archive and detached signature
+      ansible.builtin.get_url:
+        url: "{{ whonix_mirror }}/Whonix-Xfce-{{ whonix_version }}.Intel_AMD64.qcow2.libvirt.xz{{ item }}"
+        dest: "{{ image_dir }}/Whonix-Xfce-{{ whonix_version }}.Intel_AMD64.qcow2.libvirt.xz{{ item }}"
+        mode: '0600'
+      loop:
+        - ""
+        - ".asc"
+
+    - name: Verify detached signature
+      # Hard gate. If this fails nothing downstream runs, which is the point.
+      ansible.builtin.command:
+        cmd: >-
+          gpg --status-fd 1 --verify
+          {{ image_dir }}/Whonix-Xfce-{{ whonix_version }}.Intel_AMD64.qcow2.libvirt.xz.asc
+          {{ image_dir }}/Whonix-Xfce-{{ whonix_version }}.Intel_AMD64.qcow2.libvirt.xz
+      register: gpgverify
+      changed_when: false
+      failed_when: >-
+        'GOODSIG' not in gpgverify.stdout
+        or whonix_signing_key_fpr[-16:] | upper not in (gpgverify.stdout | upper)
+
+    - name: Extract images
+      ansible.builtin.unarchive:
+        src: "{{ image_dir }}/Whonix-Xfce-{{ whonix_version }}.Intel_AMD64.qcow2.libvirt.xz"
+        dest: "{{ image_dir }}"
+        remote_src: true
+
+    - name: Install the Workstation image as an immutable gold master
+      # The gold image is chmod 0444 and never attached to a running domain
+      # directly — only as a read-only qcow2 backing file. Nothing can write
+      # through it, so there is no state to revert.
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          shopt -s nullglob
+          for f in {{ image_dir }}/*Workstation*.qcow2; do
+            install -m 0444 -o root -g root "$f" {{ gold_dir }}/workstation-gold.qcow2
+            exit 0
+          done
+          echo "no Workstation qcow2 found in {{ image_dir }}" >&2
+          exit 1
+      args:
+        creates: "{{ gold_dir }}/workstation-gold.qcow2"
+
+    # ======================================================================
+    # Amnesic session manager
+    # ======================================================================
+
+    - name: Install amnesic-vm-manager
+      ansible.builtin.copy:
+        src: ../bin/amnesic-vm-manager
+        dest: /usr/local/bin/amnesic-vm-manager
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create tmpfs mount for session overlays
+      # The overlay is where every byte the session writes lands. Putting it on
+      # tmpfs means it is never written to persistent media in the first place
+      # — strictly better than writing it to disk and shredding afterwards,
+      # because shred is unreliable on SSDs with wear levelling and on any
+      # copy-on-write filesystem.
+      ansible.builtin.mount:
+        path: /run/amnesic
+        src: tmpfs
+        fstype: tmpfs
+        opts: "rw,nosuid,nodev,noexec,noatime,mode=0700,size={{ amnesic_tmpfs_size }}"
+        state: mounted
+
+  handlers:
+    - name: reload sysctl
+      ansible.builtin.command:
+        cmd: sysctl --system
+
+    - name: regenerate grub debian
+      ansible.builtin.command:
+        cmd: update-grub

@@ -1,0 +1,65 @@
+#!/bin/bash
+#
+# /usr/local/bin/anon-disp — launch a throwaway Tor-bound workspace.
+#
+# Bind to a hotkey (Ctrl+Alt+A suggested) via your desktop environment's
+# custom shortcut settings. Runs in dom0; keep it short and keep it boring.
+#
+# Usage:
+#   anon-disp              # Tor Browser in a fresh disposable
+#   anon-disp xterm        # terminal in a fresh disposable
+#   anon-disp -- <url>     # Tor Browser opened at <url>
+#
+# Each invocation produces a brand new unnamed disposable. On window close the
+# qube is destroyed and its volatile volume discarded — same end state as
+# shutting down Tails, minus the reboot.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly DVM_TEMPLATE="anon-dvm"
+readonly DEFAULT_APP="torbrowser"
+
+# --- guard: template must exist and must be Tor-bound -----------------------
+#
+# Cheap, and it turns a silent clearnet leak into a visible refusal. If
+# someone has rewired anon-dvm's netvm, we do not launch.
+
+if ! qvm-check --quiet "$DVM_TEMPLATE" 2>/dev/null; then
+    notify-send -u critical "anon-disp" "${DVM_TEMPLATE} does not exist"
+    exit 1
+fi
+
+netvm="$(qvm-prefs "$DVM_TEMPLATE" netvm)"
+if [[ "$netvm" != "sys-whonix" ]]; then
+    notify-send -u critical "anon-disp" \
+        "REFUSING TO LAUNCH: ${DVM_TEMPLATE} netvm is '${netvm}', expected sys-whonix"
+    exit 1
+fi
+
+if [[ "$(qvm-prefs "$DVM_TEMPLATE" template_for_dispvms)" != "True" ]]; then
+    notify-send -u critical "anon-disp" \
+        "${DVM_TEMPLATE} is not marked template_for_dispvms"
+    exit 1
+fi
+
+# --- dispatch ---------------------------------------------------------------
+
+if [[ "${1:-}" == "--" ]]; then
+    shift
+    url="${1:?no url given}"
+    # Hand the URL to a fresh disposable via the RPC service rather than
+    # embedding it in a command line — qubes.OpenURL does the argument
+    # sanitisation for us, and dom0 never shells out with untrusted text.
+    printf '%s' "$url" | qvm-run \
+        --dispvm="$DVM_TEMPLATE" \
+        --service -- qubes.OpenURL
+    exit 0
+fi
+
+app="${1:-$DEFAULT_APP}"
+
+exec qvm-run \
+    --dispvm="$DVM_TEMPLATE" \
+    --service -- "qubes.StartApp+${app}"

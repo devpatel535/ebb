@@ -1,0 +1,13 @@
+# /srv/user_salt/hybrid-anon.top
+#
+# Enable with:  sudo qubesctl top.enable hybrid-anon
+# Apply with:   sudo qubesctl --show-output state.apply
+#
+# Only dom0 is targeted. Everything this config does is object creation and
+# property setting through the Admin API — nothing is installed *inside* the
+# Whonix templates, which is deliberate: the less we diverge from the stock
+# Whonix images, the less we have to re-audit on every Whonix release.
+
+base:
+  dom0:
+    - hybrid-anon

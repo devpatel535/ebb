@@ -1,0 +1,371 @@
+#!/bin/bash
+#
+# /usr/local/bin/amnesic-vm-manager
+#
+# Engine B's clean-slate workspace. Launches a Whonix Workstation from an
+# immutable gold image, with every write going to a throwaway overlay on
+# tmpfs, through a transient libvirt domain that ceases to exist on shutdown.
+#
+#   amnesic-vm-manager start      launch a session (blocks until it ends)
+#   amnesic-vm-manager stop       tear down a running session
+#   amnesic-vm-manager status     show state
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS DOES NOT DO, AND WHY
+# ---------------------------------------------------------------------------
+#
+# The original spec called for a "RAM evacuation" step: after `virsh destroy`,
+# invoke memory-clearing utilities to overwrite the host RAM that was
+# allocated to the QEMU process.
+#
+# That is not implementable, and scripts claiming to do it are writing to
+# their own address space. By the time virsh destroy returns, the kernel has
+# already reclaimed QEMU's pages onto the free list. A userspace process
+# cannot address them. It can allocate a large buffer and hope to be handed
+# the same physical frames, which is superstition rather than a guarantee,
+# and with page_alloc.shuffle=1 it is not even likely.
+#
+# The actual mechanism for "freed pages are zeroed" is the kernel boot
+# parameter init_on_free=1, applied by the playbook. It is unconditional,
+# applies to every process, and costs a little memory bandwidth.
+#
+# What this script does instead addresses the leak that genuinely matters
+# forensically:
+#
+#   1. Guest RAM is mlocked and unshared (memoryBacking locked +
+#      nosharepages), so it cannot be swapped to disk mid-session.
+#   2. Session writes go to tmpfs, so they never reach persistent media.
+#   3. The domain is transient (virsh create, not define), so no XML, no
+#      logs under /var/lib/libvirt/qemu, and no NVRAM survive it.
+#   4. Core dumps are disabled host-wide by the sysctl set, so a QEMU crash
+#      cannot spill guest memory onto disk.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly GOLD="/var/lib/libvirt/images/whonix-gold/workstation-gold.qcow2"
+readonly OVERLAY_DIR="/run/amnesic"
+readonly DOMAIN="amnesic-ws"
+readonly GATEWAY_DOMAIN="Whonix-Gateway-Xfce"
+readonly LOGFILE="/run/amnesic/session.log"
+
+log() { printf '%s [amnesic] %s\n' "$(date -u +%H:%M:%SZ)" "$*" | tee -a "$LOGFILE" >&2; }
+die() { printf '%s [amnesic] FATAL: %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2; exit 1; }
+
+require_root() {
+    [[ "$(id -u)" -eq 0 ]] || die "must run as root (libvirt system URI)"
+}
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+
+preflight() {
+    [[ -f "$GOLD" ]] || die "gold image missing: $GOLD"
+
+    # The gold image must be read-only on disk. If someone has chmod'd it, a
+    # previous session may already have written through to it, and the
+    # "pristine every launch" guarantee is void.
+    local perms
+    perms="$(stat -c '%a' "$GOLD")"
+    [[ "$perms" == "444" ]] \
+        || die "gold image perms are $perms, expected 444 — it may have been written to. Re-extract it."
+
+    mountpoint -q "$OVERLAY_DIR" \
+        || die "$OVERLAY_DIR is not a tmpfs mount. Session writes would hit disk. Run the playbook."
+
+    # Overlay tmpfs must not be backed by swap, or we have reintroduced the
+    # exact leak we just removed.
+    if [[ "$(swapon --show --noheadings | wc -l)" -gt 0 ]]; then
+        log "WARNING: swap is active. tmpfs pages can be swapped out."
+        log "         Run 'swapoff -a' before a session that matters, or put"
+        log "         swap on an encrypted volume with an ephemeral key"
+        log "         (crypttab 'swap' entry keyed from /dev/urandom)."
+    fi
+
+    virsh net-info Whonix-Internal >/dev/null 2>&1 \
+        || die "Whonix-Internal network is not defined"
+
+    # If the host has an address on the isolated bridge, it is not isolated,
+    # and the Workstation has a route to something it should not.
+    if ip -4 addr show virbr2 2>/dev/null | grep -q 'inet '; then
+        die "virbr2 has a host IP address — Whonix-Internal is not isolated. Refusing to launch."
+    fi
+
+    if ! virsh domstate "$GATEWAY_DOMAIN" 2>/dev/null | grep -q running; then
+        log "gateway $GATEWAY_DOMAIN is not running; starting it"
+        virsh start "$GATEWAY_DOMAIN" >/dev/null
+        local waited=0
+        until virsh domstate "$GATEWAY_DOMAIN" | grep -q running; do
+            sleep 2
+            waited=$((waited + 2))
+            (( waited > 60 )) && die "gateway failed to start within 60s"
+        done
+        log "gateway up; allowing 20s for Tor bootstrap before the workstation talks"
+        sleep 20
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Overlay
+# ---------------------------------------------------------------------------
+
+make_overlay() {
+    local overlay="${OVERLAY_DIR}/${DOMAIN}-$(date +%s).qcow2"
+
+    # -F qcow2 is not optional. Without an explicit backing format, QEMU
+    # probes it, and format probing on an attacker-influenced image has its
+    # own CVE history.
+    qemu-img create -f qcow2 -F qcow2 -b "$GOLD" "$overlay" >/dev/null
+
+    chmod 0600 "$overlay"
+    printf '%s' "$overlay"
+}
+
+# ---------------------------------------------------------------------------
+# Domain XML
+# ---------------------------------------------------------------------------
+
+emit_domain_xml() {
+    local overlay="$1"
+
+    cat <<XMLEOF
+<domain type='kvm'>
+  <name>${DOMAIN}</name>
+  <memory unit='MiB'>2048</memory>
+  <currentMemory unit='MiB'>2048</currentMemory>
+
+  <!--
+    locked: guest RAM is mlocked, so the kernel cannot page it out to disk
+            mid-session. This is the forensic guarantee the spec's post-hoc
+            "RAM evacuation" was reaching for and could not deliver.
+    nosharepages: excludes this guest's memory from KSM. Memory deduplication
+            across guests is a documented side channel allowing cross-VM
+            inference of page contents.
+  -->
+  <memoryBacking>
+    <locked/>
+    <nosharepages/>
+  </memoryBacking>
+
+  <vcpu placement='static'>2</vcpu>
+
+  <os>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+
+  <!--
+    CPU TOPOLOGY HIDING.
+
+    mode='custom' with a deliberately generic model. NOT host-passthrough:
+    passthrough hands the guest your exact CPUID, stepping and feature set,
+    which is a high-entropy hardware fingerprint that survives into anything
+    running inside, Tor Browser included.
+
+    The flat 1-socket / 2-core / 1-thread topology hides the real core
+    layout — a P-core/E-core split is itself identifying on 12th gen Intel
+    and later.
+
+    invtsc is disabled: an invariant TSC exposed to the guest is a
+    high-resolution, host-stable timer, the primary primitive for cross-VM
+    timing side channels.
+
+    Cost: you lose AES-NI and newer vector extensions unless you add them
+    back by name. Acceptable for a browsing VM; measure before applying this
+    to anything compute-bound.
+  -->
+  <cpu mode='custom' match='exact' check='partial'>
+    <model fallback='allow'>Nehalem</model>
+    <topology sockets='1' dies='1' cores='2' threads='1'/>
+    <feature policy='disable' name='invtsc'/>
+    <feature policy='disable' name='rdtscp'/>
+  </cpu>
+
+  <!--
+    Clock: UTC, no kvmclock host passthrough. sdwdate inside the Whonix
+    Gateway handles time over Tor. The guest must not learn the host's
+    precise clock, because clock skew is a durable machine fingerprint.
+  -->
+  <clock offset='utc'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+    <timer name='kvmclock' present='no'/>
+  </clock>
+
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>destroy</on_reboot>
+  <on_crash>destroy</on_crash>
+
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+
+    <disk type='file' device='disk'>
+      <!--
+        cache='unsafe' is correct HERE and nowhere else. It tells QEMU to
+        ignore flush requests, because durability of this disk is explicitly
+        undesirable: writes should stay in page cache / tmpfs and die with
+        the session. On a persistent VM this flag risks corruption; on an
+        intentionally amnesic one it is the entire point.
+      -->
+      <driver name='qemu' type='qcow2' cache='unsafe' discard='unmap'/>
+      <source file='${overlay}'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+
+    <!--
+      Single NIC, on the isolated bridge only. The Workstation has NO
+      interface on Whonix-External and therefore no path to the host's NAT
+      or the physical NIC. Structurally equivalent to Qubes giving a qube
+      exactly one netvm.
+    -->
+    <interface type='network'>
+      <source network='Whonix-Internal'/>
+      <model type='virtio'/>
+    </interface>
+
+    <graphics type='spice' autoport='yes' listen='127.0.0.1'>
+      <image compression='off'/>
+    </graphics>
+    <video>
+      <model type='qxl' vram='65536'/>
+    </video>
+
+    <!--
+      No shared folders, no clipboard channel, no USB redirection. Each of
+      those is a deliberate hole between the amnesic environment and the
+      persistent host; add one back only when you have a reason you could
+      defend out loud.
+    -->
+    <controller type='usb' model='none'/>
+
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+    </rng>
+
+    <memballoon model='none'/>
+  </devices>
+</domain>
+XMLEOF
+}
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
+
+cmd_start() {
+    require_root
+    mkdir -p "$OVERLAY_DIR"
+    : > "$LOGFILE"
+
+    log "preflight"
+    preflight
+
+    if virsh domstate "$DOMAIN" >/dev/null 2>&1; then
+        die "$DOMAIN already exists — run 'stop' first"
+    fi
+
+    local overlay xmlfile
+    overlay="$(make_overlay)"
+    log "overlay: $overlay (tmpfs, backing $GOLD read-only)"
+
+    xmlfile="${OVERLAY_DIR}/${DOMAIN}.xml"
+    emit_domain_xml "$overlay" > "$xmlfile"
+    chmod 0600 "$xmlfile"
+
+    # Teardown on every exit path, including Ctrl-C and errexit.
+    # shellcheck disable=SC2064
+    trap "teardown '$overlay' '$xmlfile'" EXIT INT TERM
+
+    # `virsh create` makes a TRANSIENT domain: no persistent XML is written
+    # under /etc/libvirt, so when it stops it leaves no definition behind.
+    log "starting transient domain $DOMAIN"
+    virsh create "$xmlfile" >/dev/null
+
+    log "session live — close the VM or run 'amnesic-vm-manager stop' to end it"
+
+    while virsh domstate "$DOMAIN" 2>/dev/null | grep -q running; do
+        sleep 3
+    done
+
+    log "domain exited"
+}
+
+teardown() {
+    local overlay="${1:-}" xmlfile="${2:-}"
+
+    log "teardown"
+
+    if virsh domstate "$DOMAIN" >/dev/null 2>&1; then
+        log "destroying $DOMAIN"
+        virsh destroy "$DOMAIN" >/dev/null 2>&1 || true
+    fi
+
+    # The overlay lives on tmpfs, so unlinking it hands the pages back to the
+    # kernel, which zeroes them on free (init_on_free=1). There is no shred
+    # step because there is no persistent medium to shred — and on an SSD
+    # with wear levelling, or any copy-on-write filesystem, shred is false
+    # comfort anyway.
+    if [[ -n "$overlay" && -f "$overlay" ]]; then
+        log "unlinking overlay ($(du -h "$overlay" | cut -f1) of session writes)"
+        rm -f -- "${overlay:?overlay path empty}"
+    fi
+
+    if [[ -n "$xmlfile" && -f "$xmlfile" ]]; then
+        rm -f -- "${xmlfile:?xml path empty}"
+    fi
+
+    # If the gold image's mtime moved, something wrote through the backing
+    # file and every assumption above is void. Worth seeing on every teardown.
+    if [[ -f "$GOLD" ]]; then
+        log "gold image mtime: $(stat -c '%y' "$GOLD")"
+    fi
+
+    log "session destroyed"
+}
+
+cmd_stop() {
+    require_root
+
+    if virsh destroy "$DOMAIN" >/dev/null 2>&1; then
+        log "destroyed $DOMAIN"
+    else
+        log "$DOMAIN was not running"
+    fi
+
+    # :? guards — if either variable is somehow empty, the shell aborts here
+    # rather than handing rm a path that globs against the filesystem root.
+    # This script runs as root; the guard is cheap and the failure is not.
+    rm -f -- "${OVERLAY_DIR:?}/${DOMAIN:?}-"*.qcow2 2>/dev/null || true
+    rm -f -- "${OVERLAY_DIR:?}/${DOMAIN:?}.xml" 2>/dev/null || true
+
+    log "overlays cleared"
+}
+
+cmd_status() {
+    printf 'domain:   %s\n' "$(virsh domstate "$DOMAIN" 2>/dev/null || echo 'not present')"
+    printf 'gateway:  %s\n' "$(virsh domstate "$GATEWAY_DOMAIN" 2>/dev/null || echo 'not present')"
+    printf 'gold:     %s (mode %s)\n' "$GOLD" "$(stat -c '%a' "$GOLD" 2>/dev/null || echo missing)"
+    printf 'overlays: %s\n' "$(find "$OVERLAY_DIR" -maxdepth 1 -name '*.qcow2' 2>/dev/null | wc -l)"
+    printf 'tmpfs:    %s\n' "$(findmnt -n -o SIZE,AVAIL "$OVERLAY_DIR" 2>/dev/null || echo 'NOT MOUNTED')"
+    printf 'swap:     %s device(s) active\n' "$(swapon --show --noheadings | wc -l)"
+    printf 'virbr2:   %s\n' \
+        "$(ip -4 addr show virbr2 2>/dev/null | grep -q 'inet ' && echo 'HAS HOST IP — NOT ISOLATED' || echo 'no host IP (correct)')"
+}
+
+case "${1:-}" in
+    start)  cmd_start  ;;
+    stop)   cmd_stop   ;;
+    status) cmd_status ;;
+    *)
+        printf 'usage: %s {start|stop|status}\n' "${0##*/}" >&2
+        exit 2
+        ;;
+esac

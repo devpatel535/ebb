@@ -1,0 +1,15 @@
+# Machine-specific Ansible values — whonix_version, signing key fingerprint,
+# tuned sizes, hostnames. Keep the repo generic; keep your box out of it.
+vars.local.yml
+*.local.yml
+
+# Never commit images or signatures
+*.qcow2
+*.xz
+*.asc
+*.sig
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*~

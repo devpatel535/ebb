@@ -1,0 +1,17 @@
+---
+# Copy to vars.local.yml (gitignored) and fill in.
+#
+#   ansible-playbook -i localhost, -c local -K -e @vars.local.yml playbook.yml
+
+# Fetch this YOURSELF from https://www.whonix.org/wiki/Whonix_Signing_Key
+# over a connection you trust. A fingerprint handed to you inside a script is
+# a fingerprint you have not verified, and checking a signature against an
+# unverified key proves nothing.
+whonix_signing_key_fpr: ""
+
+# The release you actually downloaded and intend to verify, e.g. "18.0.0.0.0"
+whonix_version: ""
+
+# Session overlay tmpfs. This is RAM — size it against your 24GB, not against
+# the disk. 4G is comfortable for browsing.
+amnesic_tmpfs_size: "4G"

@@ -1,0 +1,22 @@
+<!--
+  Whonix-Internal
+
+  Gateway <-> Workstation. Nothing else.
+
+  Note what is ABSENT, because the absences are the security property:
+    - no <forward>   : libvirt creates no NAT or routing; packets cannot
+                       leave this bridge for any host interface.
+    - no <ip>        : the host has no address on this bridge, so the host
+                       itself is not reachable from the Workstation and
+                       cannot be used as an accidental gateway.
+    - no <dhcp>      : no dnsmasq instance is spawned. Whonix images carry
+                       static addressing (10.152.152.10 / .11) and a DHCP
+                       server here would be both redundant and an extra
+                       host-side daemon listening on a guest-facing bridge.
+
+  The result is a cable between two machines, with no third party on it.
+-->
+<network>
+  <name>Whonix-Internal</name>
+  <bridge name='virbr2' stp='on' delay='0'/>
+</network>
